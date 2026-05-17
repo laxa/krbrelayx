@@ -300,6 +300,21 @@ def print_record(record, ts=False):
         print(' - Primary server: %s' %  record_data['namePrimaryServer'].toFqdn())
         print(' - Zone admin email: %s' %  record_data['zoneAdminEmail'].toFqdn())
 
+def fqdn_to_dns_count_name(fqdn):
+    """Encode a dotted FQDN string into a DNS_COUNT_NAME binary structure."""
+    if fqdn.endswith('.'):
+        fqdn = fqdn[:-1]
+    labels = fqdn.split('.')
+    raw = b''
+    for label in labels:
+        encoded = label.encode('utf-8')
+        raw += bytes([len(encoded)]) + encoded
+    raw += b'\x00'
+    dc = DNS_COUNT_NAME()
+    dc['LabelCount'] = len(labels)
+    dc['RawName'] = raw
+    return dc
+
 def new_record(rtype, serial):
     nr = DNS_RECORD()
     nr['Type'] = rtype
@@ -363,8 +378,8 @@ def main():
                              "modify an existing record), query (show existing), remove (mark record "
                              "for cleanup from DNS cache), delete (delete from LDAP). Default: query"
                         )
-    recordopts.add_argument("-t", "--type", choices=['A'], default='A', help="Record type to add (Currently only A records supported)")
-    recordopts.add_argument("-d", "--data", metavar='RECORDDATA', help="Record data (IP address)")
+    recordopts.add_argument("-t", "--type", choices=['A', 'NS'], default='A', help="Record type to add (default: A)")
+    recordopts.add_argument("-d", "--data", metavar='RECORDDATA', help="Record data (IP address for A, FQDN for NS)")
     recordopts.add_argument("--allow-multiple", action='store_true', help="Allow multiple A records for the same name")
     recordopts.add_argument("--ttl", type=int, default=180, help="TTL for record (default: 180)")
 
@@ -519,21 +534,27 @@ def main():
             print_record(dr, targetentry['attributes']['dNSTombstoned'])
             continue
     elif args.action == 'add':
-        # Only A records for now
-        addtype = 1
+        addtype = 1 if args.type == 'A' else 2
         # Entry exists
         if targetentry:
             if not args.allow_multiple:
                 for record in targetentry['raw_attributes']['dnsRecord']:
                     dr = DNS_RECORD(record)
-                    if dr['Type'] == 1:
-                        address = DNS_RPC_RECORD_A(dr['Data'])
-                        print_f('Record already exists and points to %s. Use --action modify to overwrite or --allow-multiple to override this' % address.formatCanonical())
+                    if dr['Type'] == addtype:
+                        if addtype == 1:
+                            address = DNS_RPC_RECORD_A(dr['Data'])
+                            print_f('Record already exists and points to %s. Use --action modify to overwrite or --allow-multiple to override this' % address.formatCanonical())
+                        else:
+                            address = DNS_RPC_RECORD_NODE_NAME(dr['Data'])
+                            print_f('Record already exists and points to %s. Use --action modify to overwrite or --allow-multiple to override this' % address['nameNode'].toFqdn())
                         return False
-            # If we are here, no A records exists yet
             record = new_record(addtype, get_next_serial(args.dns_ip, args.host, zone,args.tcp))
-            record['Data'] = DNS_RPC_RECORD_A()
-            record['Data'].fromCanonical(args.data)
+            if addtype == 1:
+                record['Data'] = DNS_RPC_RECORD_A()
+                record['Data'].fromCanonical(args.data)
+            else:
+                record['Data'] = DNS_RPC_RECORD_NODE_NAME()
+                record['Data']['nameNode'] = fqdn_to_dns_count_name(args.data).getData()
             print_m('Adding extra record')
             c.modify(targetentry['dn'], {'dnsRecord': [(MODIFY_ADD, record.getData())]})
             print_operation_result(c.result)
@@ -545,30 +566,38 @@ def main():
                 'name': target
             }
             record = new_record(addtype, get_next_serial(args.dns_ip, args.host, zone,args.tcp))
-            record['Data'] = DNS_RPC_RECORD_A()
-            record['Data'].fromCanonical(args.data)
+            if addtype == 1:
+                record['Data'] = DNS_RPC_RECORD_A()
+                record['Data'].fromCanonical(args.data)
+            else:
+                record['Data'] = DNS_RPC_RECORD_NODE_NAME()
+                record['Data']['nameNode'] = fqdn_to_dns_count_name(args.data).getData()
             record_dn = 'DC=%s,%s' % (target, searchtarget)
             node_data['dnsRecord'] = [record.getData()]
             print_m('Adding new record')
             c.add(record_dn, ['top', 'dnsNode'], node_data)
             print_operation_result(c.result)
     elif args.action == 'modify':
-        # Only A records for now
-        addtype = 1
+        addtype = 1 if args.type == 'A' else 2
         # We already know the entry exists
         targetrecord = None
         records = []
         for record in targetentry['raw_attributes']['dnsRecord']:
             dr = DNS_RECORD(record)
-            if dr['Type'] == 1:
+            if dr['Type'] == addtype:
                 targetrecord = dr
             else:
                 records.append(record)
         if not targetrecord:
-            print_f('No A record exists yet. Use --action add to add it')
+            print_f('No %s record exists yet. Use --action add to add it' % args.type)
+            return
         targetrecord['Serial'] = get_next_serial(args.dns_ip, args.host, zone,args.tcp)
-        targetrecord['Data'] = DNS_RPC_RECORD_A()
-        targetrecord['Data'].fromCanonical(args.data)
+        if addtype == 1:
+            targetrecord['Data'] = DNS_RPC_RECORD_A()
+            targetrecord['Data'].fromCanonical(args.data)
+        else:
+            targetrecord['Data'] = DNS_RPC_RECORD_NODE_NAME()
+            targetrecord['Data']['nameNode'] = fqdn_to_dns_count_name(args.data).getData()
         records.append(targetrecord.getData())
         print_m('Modifying record')
         c.modify(targetentry['dn'], {'dnsRecord': [(MODIFY_REPLACE, records)]})
@@ -580,9 +609,13 @@ def main():
             targetrecord = None
             for record in targetentry['raw_attributes']['dnsRecord']:
                 dr = DNS_RECORD(record)
-                if dr['Type'] == 1:
+                if args.type == 'A' and dr['Type'] == 1:
                     tr = DNS_RPC_RECORD_A(dr['Data'])
                     if tr.formatCanonical() == args.data:
+                        targetrecord = record
+                elif args.type == 'NS' and dr['Type'] == 2:
+                    tr = DNS_RPC_RECORD_NODE_NAME(dr['Data'])
+                    if tr['nameNode'].toFqdn().rstrip('.') == args.data.rstrip('.'):
                         targetrecord = record
             if not targetrecord:
                 print_f('Could not find a record with the specified data')
